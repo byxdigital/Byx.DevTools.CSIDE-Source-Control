@@ -22,10 +22,11 @@ namespace CSIDESourceControl.Client.ViewModels
 {
     public class ObjectsViewModel : INotifyPropertyChanged
     {
-        private IObjectsViewDialogService _dialogService;
+        private readonly IObjectsViewDialogService _dialogService;
         private ObservableCollection<NavObjectModel> _navObjects;
         private string _destinationFolder;
         private string _gitOutput;
+        private string _gitBranch;
         private string _gitRemoteUrl;
         private string _gitCommitMessage;
         private bool _isWorking;
@@ -48,7 +49,7 @@ namespace CSIDESourceControl.Client.ViewModels
         public ObjectsViewModel(IObjectsViewDialogService dialogService)
         {
             _dialogService = dialogService;
-            _dialogService.TimerElapsed += _dialogService_TimerElapsed;
+            _dialogService.TimerElapsed += DialogService_TimerElapsed;
             _navObjects = new ObservableCollection<NavObjectModel>();
 
             LoadRecentFolder();
@@ -71,6 +72,12 @@ namespace CSIDESourceControl.Client.ViewModels
         {
             get { return _gitRemoteUrl; }
             set { _gitRemoteUrl = value; OnPropertyChange("GitRemoteUrl"); }
+        }
+
+        public string GitBranch
+        {
+            get { return _gitBranch; }
+            set { _gitBranch = value; OnPropertyChange("GitBranch"); }
         }
 
         public string GitOutput
@@ -157,7 +164,7 @@ namespace CSIDESourceControl.Client.ViewModels
             {
                 if (_gitSync == null)
                 {
-                    _gitSync = new RelayCommand<object>(param => GitSync(), param => true);
+                    _gitSync = new RelayCommand<object>(async(param) => await GitSync(), param => true);
                 }
                 return _gitSync;
             }
@@ -257,11 +264,10 @@ namespace CSIDESourceControl.Client.ViewModels
 
         private void SelectDestinationFolder()
         {
-            string path = string.Empty;
-
-            if (_dialogService.GetFolder("Select Destination Folder", out path))
+            if (_dialogService.GetFolder("Select Destination Folder", out string path))
                 DestinationFolder = path;
 
+            GitGetBranch();
             GitGetRemote();
             SaveRecentFolder();
             LoadFromDestinationFolder();
@@ -275,10 +281,11 @@ namespace CSIDESourceControl.Client.ViewModels
             SettingsHelper settingsHelper = new SettingsHelper(DestinationFolder);
             ServerSetupModel currentServerSetup = settingsHelper.ReadServerSettings();
             ExportFilterModel exportFilter = settingsHelper.ReadFilterSettings();
+            GitSettingsModel gitSettingsModel = settingsHelper.ReadGitSettings();
 
             if (_dialogService.ShowServerSettings(ref currentServerSetup))
             {
-                settingsHelper.SerializeToSettingsFile(currentServerSetup, exportFilter);
+                settingsHelper.SerializeToSettingsFile(currentServerSetup, exportFilter, gitSettingsModel);
             }
         }
 
@@ -316,7 +323,7 @@ namespace CSIDESourceControl.Client.ViewModels
                 return;
 
             if (!IsDestinationFolderSet())
-                return;
+                throw new Exception("You must set working/destination folder first!");
 
             try
             {
@@ -325,16 +332,32 @@ namespace CSIDESourceControl.Client.ViewModels
                     // First import the "big" object file
                     string filePath = filePaths[0];
                     ObjectsImport objectFileImport = new ObjectsImport();
-                    objectFileImport.RunImportFromObjectFile(filePath);
-                    objectFileImport.CleanUpRemovedFiles(DestinationFolder);
+                    objectFileImport.RunImportFromOneSingleObjectFile(filePath);
+
+                    int noOfRemovedFiles;
+                    bool filesIsRemoved = false;
+                    if (objectFileImport.IsRemovedFiles(DestinationFolder, out noOfRemovedFiles))
+                    {
+                        if (_dialogService.ShowConfirmMessage("Delete Existsing Files",
+                            string.Format("There is {0} files that does not exists in this file. Would you like to delete those? If not the new will only overwrite or add to the existsing ones.",
+                            noOfRemovedFiles)))
+                        {
+                            objectFileImport.CleanUpRemovedFiles(DestinationFolder);
+                            filesIsRemoved = true;
+                        }
+
+                    }
 
                     // Export in folders to new destination
-                    ObjectsExport.ExportObjects(objectFileImport.GetObjectList(), DestinationFolder);
+                    ObjectsExport.ExportObjectsToSeparateFolders(objectFileImport.GetObjectList(), DestinationFolder);
 
                     // Now reimport from new destination to get all files
                     LoadFromDestinationFolder();
 
-                    GitOutput = string.Format("Import success");
+                    if (filesIsRemoved)
+                        GitOutput = string.Format("Import success");
+                    else
+                        GitStatus();
                 }
             }
             catch (Exception ex)
@@ -350,17 +373,18 @@ namespace CSIDESourceControl.Client.ViewModels
 
             SettingsHelper settingHelper = new SettingsHelper(DestinationFolder);
             ExportFilterModel exportFilter = settingHelper.ReadFilterSettings();
+            GitSettingsModel gitSettingsModel = settingHelper.ReadGitSettings();
 
             SettingsHelper reader = new SettingsHelper(DestinationFolder);
             ServerSetupModel serverSetup = reader.ReadServerSettings();
 
             if (_dialogService.ImportFromFinExe(DestinationFolder, ref exportFilter))
             {
-                await Export(settingHelper, exportFilter, serverSetup);
+                await Export(settingHelper, exportFilter, serverSetup, gitSettingsModel);
             }
         }
 
-        private async Task Export(SettingsHelper settingHelper, ExportFilterModel exportFilter, ServerSetupModel serverSetup)
+        private async Task Export(SettingsHelper settingHelper, ExportFilterModel exportFilter, ServerSetupModel serverSetup, GitSettingsModel gitSettingsModel)
         {
             ExportFinexeHelper exportFinExe = new ExportFinexeHelper();
             exportFinExe.OnExportError += ExportFinExe_OnExportError;
@@ -375,7 +399,7 @@ namespace CSIDESourceControl.Client.ViewModels
                 ImportFiles(importFiles);
 
                 // Save Config
-                settingHelper.SerializeToSettingsFile(serverSetup, exportFilter);
+                settingHelper.SerializeToSettingsFile(serverSetup, exportFilter, gitSettingsModel);
             }
             else
             {
@@ -403,6 +427,8 @@ namespace CSIDESourceControl.Client.ViewModels
 
                 if (string.IsNullOrEmpty(GitCommitMessage))
                     throw new Exception("Commit message can't be empty.");
+
+                GitGetBranch();
 
                 GitProcess.Excecute(DestinationFolder, "add --all", out string output);
                 GitOutput = output;
@@ -437,12 +463,14 @@ namespace CSIDESourceControl.Client.ViewModels
                 // Settings
                 SettingsHelper settingHelper = new SettingsHelper(DestinationFolder); 
                 if(!settingHelper.SettingsFolderExists())
-                    settingHelper.SerializeToSettingsFile(new ServerSetupModel(), new ExportFilterModel());
+                    settingHelper.SerializeToSettingsFile(new ServerSetupModel(), new ExportFilterModel(), new GitSettingsModel());
 
                 // .gitignore
                 GitHelper.CreateGitFiles(DestinationFolder);
 
                 GitProcess.Excecute(DestinationFolder, "init", out string output);
+
+                GitGetBranch();
 
                 CheckGitOutput(output);
                 GitOutput = output;
@@ -466,6 +494,7 @@ namespace CSIDESourceControl.Client.ViewModels
             {
                 IsWorking = true;
 
+                GitGetBranch();
                 GitGetRemote();
 
                 GitProcess.Excecute(DestinationFolder, "status", out string output);
@@ -494,12 +523,17 @@ namespace CSIDESourceControl.Client.ViewModels
 
             try
             {
-                GitGetRemote();
+                SettingsHelper settingHelper = new SettingsHelper(DestinationFolder);
+                GitSettingsModel gitSettingsModel = settingHelper.ReadGitSettings();
+
                 GitOutput = "Start sync...";
+
+                GitGetBranch();
+                GitGetRemote();
 
                 StartWorking("Sync");
 
-                GitResult pullResult = await GitProcess.ExcecuteASync(DestinationFolder, "pull origin master");
+                GitResult pullResult = await GitProcess.ExcecuteASync(DestinationFolder, string.Format("pull origin {0}", GitBranch));
                 if (pullResult.ExitCode != 0)
                     GitOutput = pullResult.Output;
 
@@ -526,13 +560,17 @@ namespace CSIDESourceControl.Client.ViewModels
 
             try
             {
+                SettingsHelper settingHelper = new SettingsHelper(DestinationFolder);
+                GitSettingsModel gitSettingsModel = settingHelper.ReadGitSettings();
+
                 StartWorking("Push");
 
+                GitGetBranch();
                 GitGetRemote();
 
-                GitProcess.Excecute(DestinationFolder, "push --set-upstream origin master", out string output);
-                GitOutput = output;
+                GitProcess.Excecute(DestinationFolder, string.Format("push --set-upstream origin {0}", GitBranch), out string output);
 
+                GitOutput = output;
             }
             catch (Exception ex)
             {
@@ -551,11 +589,15 @@ namespace CSIDESourceControl.Client.ViewModels
 
             try
             {
+                SettingsHelper settingHelper = new SettingsHelper(DestinationFolder);
+                GitSettingsModel gitSettingsModel = settingHelper.ReadGitSettings();
+
                 IsWorking = true;
 
+                GitGetBranch();
                 GitGetRemote();
 
-                GitProcess.Excecute(DestinationFolder, "pull origin master", out string output);
+                GitProcess.Excecute(DestinationFolder, string.Format("pull origin {0}", GitBranch), out string output);
                 GitOutput = output;
 
                 GitStatus();
@@ -608,6 +650,26 @@ namespace CSIDESourceControl.Client.ViewModels
             {
                 _dialogService.ShowErrorMessage("Git Status Error", ex.Message);
             }
+            finally
+            {
+                IsWorking = false;
+            }
+        }
+
+        private void GitGetBranch()
+        {
+            try
+            {
+                IsWorking = true;
+
+                GitProcess.Excecute(DestinationFolder, string.Format(@"branch --show-current"), out string output);
+                GitBranch = Regex.Replace(output, @"\t|\n|\r", string.Empty);
+            }
+            catch (Exception ex)
+            {
+                _dialogService.ShowErrorMessage("Git Status Error", ex.Message);
+            }
+            finally
             {
                 IsWorking = false;
             }
@@ -627,7 +689,7 @@ namespace CSIDESourceControl.Client.ViewModels
             return !string.IsNullOrEmpty(DestinationFolder);
         }
 
-        private void _dialogService_TimerElapsed(int value)
+        private void DialogService_TimerElapsed(int value)
         {
             ProgressBarValue = value;
         }
@@ -703,10 +765,7 @@ namespace CSIDESourceControl.Client.ViewModels
 
         protected void OnPropertyChange(string propertyName)
         {
-            if (PropertyChanged != null)
-            {
-                PropertyChanged(this, new PropertyChangedEventArgs(propertyName));
-            }
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
     }
 }
